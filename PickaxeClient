@@ -1,0 +1,422 @@
+-- LocalScript inside the Pickaxe Tool
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local tool = script.Parent
+local handle = tool:WaitForChild("Handle")
+
+-- Wait for or create RemoteEvent
+local remoteEvent = ReplicatedStorage:WaitForChild("MineOreEvent", 5)
+if not remoteEvent then
+	remoteEvent = Instance.new("RemoteEvent")
+	remoteEvent.Name = "MineOreEvent"
+	remoteEvent.Parent = ReplicatedStorage
+end
+
+-- Wait for server response RemoteEvent
+local mineResponseEvent = ReplicatedStorage:WaitForChild("MineResponseEvent", 5)
+if not mineResponseEvent then
+	mineResponseEvent = Instance.new("RemoteEvent")
+	mineResponseEvent.Name = "MineResponseEvent"
+	mineResponseEvent.Parent = ReplicatedStorage
+end
+
+-- Wait for ore health request RemoteEvent
+local oreHealthRequestEvent = ReplicatedStorage:WaitForChild("OreHealthRequestEvent", 5)
+if not oreHealthRequestEvent then
+	oreHealthRequestEvent = Instance.new("RemoteEvent")
+	oreHealthRequestEvent.Name = "OreHealthRequestEvent"
+	oreHealthRequestEvent.Parent = ReplicatedStorage
+end
+
+-- Wait for ore health response RemoteEvent
+local oreHealthResponseEvent = ReplicatedStorage:WaitForChild("OreHealthResponseEvent", 5)
+if not oreHealthResponseEvent then
+	oreHealthResponseEvent = Instance.new("RemoteEvent")
+	oreHealthResponseEvent.Name = "OreHealthResponseEvent"
+	oreHealthResponseEvent.Parent = ReplicatedStorage
+end
+
+-- Wait for ore health update RemoteEvent (for real-time updates)
+local oreHealthUpdateEvent = ReplicatedStorage:WaitForChild("OreHealthUpdateEvent", 5)
+if not oreHealthUpdateEvent then
+	oreHealthUpdateEvent = Instance.new("RemoteEvent")
+	oreHealthUpdateEvent.Name = "OreHealthUpdateEvent"
+	oreHealthUpdateEvent.Parent = ReplicatedStorage
+end
+
+-- CUSTOMIZE THESE VALUES FOR EACH PICKAXE
+local DAMAGE = 200  -- Change this number for different pickaxe tools
+local COOLDOWN = 1 -- Cooldown in seconds between hits
+local MAX_MINING_RANGE = 20 -- Maximum mining range (must match server)
+
+-- Animation settings
+local SWING_DURATION = 0.5 -- How long the swing animation takes
+
+-- Sound IDs - CUSTOMIZE THESE
+local HIT_SOUND_ID = "rbxassetid://7650220708" -- Sound when hitting an ore
+local NO_HIT_SOUND_ID = "rbxassetid://117297744119258" -- Sound when not hitting an ore
+local BREAK_HIT_SOUND_ID = "rbxassetid://135478009117226" -- Sound when breaking an ore (final hit)
+local BLOCKED_SOUND_ID = "rbxassetid://2390695935" -- Sound when hitting claimed ore
+
+-- SIMPLE DEBOUNCE SYSTEM (prevents bypass by unequipping/re-equipping)
+-- Store in player's PlayerGui so it persists
+local playerGui = player:WaitForChild("PlayerGui")
+local debounceStorage = playerGui:FindFirstChild("PickaxeDebounceStorage")
+if not debounceStorage then
+	debounceStorage = Instance.new("BoolValue")
+	debounceStorage.Name = "PickaxeDebounceStorage"
+	debounceStorage.Value = false -- false = can hit, true = on cooldown
+	debounceStorage.Parent = playerGui
+end
+
+-- Animation tracking
+local isAnimating = false
+local currentAnimationTrack = nil
+
+-- Sound objects
+local hitSound = Instance.new("Sound")
+hitSound.SoundId = HIT_SOUND_ID
+hitSound.Volume = 0.5
+hitSound.Parent = handle
+
+local noHitSound = Instance.new("Sound")
+noHitSound.SoundId = NO_HIT_SOUND_ID
+noHitSound.Volume = 0.3
+noHitSound.Parent = handle
+
+local breakHitSound = Instance.new("Sound")
+breakHitSound.SoundId = BREAK_HIT_SOUND_ID
+breakHitSound.Volume = 0.7
+breakHitSound.Parent = handle
+
+local blockedSound = Instance.new("Sound")
+blockedSound.SoundId = BLOCKED_SOUND_ID
+blockedSound.Volume = 0.4
+blockedSound.Parent = handle
+
+-- Health Bar GUI
+local healthBarGui = nil
+local currentHoveredOre = nil
+local lastHealthData = {} -- Store last known health data for immediate updates
+local wasInRange = false -- Track previous range state
+
+local function createHealthBarGui()
+	-- Create ScreenGui
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "OreHealthBar"
+	screenGui.Parent = playerGui
+
+	-- Create main frame - larger size
+	local frame = Instance.new("Frame")
+	frame.Name = "HealthBarFrame"
+	frame.Size = UDim2.new(0, 300, 0, 25) -- Width 300, height 25
+	frame.Position = UDim2.new(0.5, -150, 1, -110) -- Centered, 110 pixels from bottom
+	frame.BackgroundColor3 = Color3.new(0, 0, 0)
+	frame.BackgroundTransparency = 0 -- Fully opaque black background
+	frame.BorderSizePixel = 0 -- No border
+	frame.Parent = screenGui
+
+	-- Create health bar (fill)
+	local healthBar = Instance.new("Frame")
+	healthBar.Name = "HealthBar"
+	healthBar.Size = UDim2.new(0, 0, 1, 0) -- Starts empty
+	healthBar.Position = UDim2.new(0, 0, 0, 0)
+	healthBar.BackgroundColor3 = Color3.new(1, 1, 1) -- White color (will change to red if claimed)
+	healthBar.BorderSizePixel = 0
+	healthBar.Parent = frame
+
+	screenGui.Enabled = false -- Start hidden
+	return screenGui
+end
+
+local function isInMiningRange(targetPart)
+	local character = player.Character
+	if not character then return false end
+
+	local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+	if not humanoidRootPart or not targetPart then return false end
+
+	local distance = (humanoidRootPart.Position - targetPart.Position).Magnitude
+	return distance <= MAX_MINING_RANGE
+end
+
+local function updateHealthBar(currentHealth, maxHealth, oreName, oreInstance, isClaimed)
+	if not healthBarGui then
+		healthBarGui = createHealthBarGui()
+	end
+
+	-- Store health data for this ore
+	if oreInstance then
+		lastHealthData[oreInstance] = {
+			currentHealth = currentHealth,
+			maxHealth = maxHealth,
+			oreName = oreName,
+			isClaimed = isClaimed or false
+		}
+	end
+
+	local frame = healthBarGui:FindFirstChild("HealthBarFrame")
+	local healthBar = frame:FindFirstChild("HealthBar")
+
+	-- Calculate health percentage (damage taken)
+	local damageTaken = maxHealth - currentHealth
+	local damagePercentage = damageTaken / maxHealth
+
+	-- Update health bar size (fills as ore takes damage)
+	healthBar.Size = UDim2.new(damagePercentage, 0, 1, 0)
+
+	-- Change color based on claim status
+	if isClaimed then
+		healthBar.BackgroundColor3 = Color3.new(1, 0, 0) -- Red if claimed by someone else
+		print("Health bar showing RED - ore is claimed by another player")
+	else
+		healthBar.BackgroundColor3 = Color3.new(1, 1, 1) -- White if not claimed or claimed by you
+		print("Health bar showing WHITE - ore is available")
+	end
+
+	-- Show the GUI
+	healthBarGui.Enabled = true
+
+	print("Updated health bar:", oreName, "Health:", currentHealth.."/"..maxHealth, "Fill:", math.floor(damagePercentage * 100).."%, Claimed:", isClaimed)
+end
+
+local function hideHealthBar()
+	if healthBarGui then
+		healthBarGui.Enabled = false
+	end
+	currentHoveredOre = nil
+	wasInRange = false
+end
+
+local function checkMouseHover()
+	local mouse = player:GetMouse()
+	local target = mouse.Target
+	local inRange = target and isInMiningRange(target)
+
+	-- Check if we're hovering over a different ore or no ore
+	if target ~= currentHoveredOre then
+		-- Different target
+		if target and target.Parent and inRange then
+			-- New target in range - show health bar
+			if lastHealthData[target] then
+				local data = lastHealthData[target]
+				updateHealthBar(data.currentHealth, data.maxHealth, data.oreName, target, data.isClaimed)
+				print("Using cached health data for", data.oreName)
+			end
+			-- Always request fresh data from server too
+			oreHealthRequestEvent:FireServer(target)
+		else
+			-- No target or out of range - hide bar
+			hideHealthBar()
+		end
+		currentHoveredOre = target
+		wasInRange = inRange
+	elseif target and target.Parent then
+		-- Same target - check for range changes
+		if inRange and not wasInRange then
+			-- Just entered range - show health bar
+			if lastHealthData[target] then
+				local data = lastHealthData[target]
+				updateHealthBar(data.currentHealth, data.maxHealth, data.oreName, target, data.isClaimed)
+				print("Re-entered range - showing cached health data for", data.oreName)
+			end
+			-- Request fresh data from server
+			oreHealthRequestEvent:FireServer(target)
+		elseif not inRange and wasInRange then
+			-- Just left range - hide health bar
+			hideHealthBar()
+		end
+		wasInRange = inRange
+	else
+		-- No target
+		if currentHoveredOre then
+			hideHealthBar()
+		end
+	end
+end
+
+local function playSwingAnimation()
+	if isAnimating then return end
+
+	isAnimating = true
+
+	-- Get the character and humanoid
+	local character = player.Character
+	if not character then 
+		isAnimating = false
+		return 
+	end
+
+	local humanoid = character:FindFirstChild("Humanoid")
+
+	-- Play humanoid swing animation
+	if humanoid then
+		-- Stop any existing animation
+		if currentAnimationTrack then
+			currentAnimationTrack:Stop()
+			currentAnimationTrack = nil
+		end
+
+		local animationId = "rbxassetid://96871287611234"
+		local animation = Instance.new("Animation")
+		animation.AnimationId = animationId
+		currentAnimationTrack = humanoid:LoadAnimation(animation)
+
+		-- Play the animation once
+		currentAnimationTrack.Looped = false
+		currentAnimationTrack:Play()
+
+		-- Wait for animation to complete
+		spawn(function()
+			wait(SWING_DURATION)
+
+			-- Stop the animation
+			if currentAnimationTrack then
+				currentAnimationTrack:Stop()
+				currentAnimationTrack = nil
+			end
+
+			isAnimating = false
+		end)
+	else
+		isAnimating = false
+	end
+end
+
+-- Handle server response for sound playing and health bar updates
+local function onMineResponse(wasOre, targetName, wasDestroyed, targetPart, newHealth, maxHealth, isBlocked)
+	if wasOre then
+		if isBlocked then
+			-- Ore is claimed by someone else
+			blockedSound:Play()
+			print("Playing blocked sound - ore is claimed by another player:", targetName)
+		elseif wasDestroyed then
+			-- Play break sound for final hit and hide health bar
+			breakHitSound:Play()
+			hideHealthBar()
+			-- Clear cached data for destroyed ore
+			if targetPart then
+				lastHealthData[targetPart] = nil
+			end
+			print("Playing break sound for destroyed ore:", targetName)
+		else
+			-- Play regular hit sound and update health bar immediately
+			hitSound:Play()
+			print("Playing hit sound for ore:", targetName)
+
+			-- Update health bar with new health data if provided and still in range
+			if targetPart and newHealth and maxHealth and isInMiningRange(targetPart) then
+				updateHealthBar(newHealth, maxHealth, targetName, targetPart, false) -- false = not claimed (you own it now)
+			end
+		end
+	else
+		noHitSound:Play()
+		print("Playing no-hit sound for non-ore:", targetName or "nothing")
+	end
+end
+
+-- Handle ore health response from server  
+local function onOreHealthResponse(isOre, currentHealth, maxHealth, oreName, oreInstance, isClaimed)
+	if isOre and currentHealth and maxHealth and isInMiningRange(oreInstance) then
+		updateHealthBar(currentHealth, maxHealth, oreName, oreInstance, isClaimed)
+	else
+		hideHealthBar()
+	end
+end
+
+-- Handle real-time health updates from server (when other players mine)
+local function onOreHealthUpdate(oreInstance, currentHealth, maxHealth, oreName, isClaimedByOther)
+	-- Only update if we're currently viewing this ore and it's in range
+	if oreInstance == currentHoveredOre and isInMiningRange(oreInstance) then
+		updateHealthBar(currentHealth, maxHealth, oreName, oreInstance, isClaimedByOther)
+		print("Received real-time update for", oreName, "from another player mining")
+	end
+end
+
+local function onActivated()
+	-- Simple debounce check
+	if debounceStorage.Value then
+		print("Pickaxe is on cooldown!")
+		return
+	end
+
+	-- Check if animating
+	if isAnimating then
+		return
+	end
+
+	-- Start debounce
+	debounceStorage.Value = true
+
+	local mouse = player:GetMouse()
+	local target = mouse.Target
+
+	-- Always play animation when clicking
+	playSwingAnimation()
+
+	if target then
+		print("LocalScript: Attempting to hit", target.Name, "with", DAMAGE, "damage using", tool.Name)
+		-- Send target and damage to server
+		remoteEvent:FireServer(target, DAMAGE)
+	else
+		print("LocalScript: Hit nothing")
+		-- Play no-hit sound for hitting nothing
+		noHitSound:Play()
+	end
+
+	-- Wait for cooldown then reset debounce
+	spawn(function()
+		wait(COOLDOWN)
+		debounceStorage.Value = false
+		print("Pickaxe ready to use again!")
+	end)
+end
+
+-- Handle tool equipped/unequipped for cleanup
+local function onEquipped()
+	-- Only reset animation state
+	isAnimating = false
+	print("Pickaxe equipped - debounce state preserved")
+
+	-- Start mouse hover checking
+	spawn(function()
+		while tool.Parent do
+			checkMouseHover()
+			wait(0.1) -- Check every 0.1 seconds
+		end
+	end)
+end
+
+local function onUnequipped()
+	-- Stop any running animation when tool is unequipped
+	if currentAnimationTrack then
+		currentAnimationTrack:Stop()
+		currentAnimationTrack = nil
+	end
+
+	-- Stop any playing sounds
+	hitSound:Stop()
+	noHitSound:Stop()
+	breakHitSound:Stop()
+	blockedSound:Stop()
+
+	-- Hide health bar and clear cached data
+	hideHealthBar()
+	lastHealthData = {}
+
+	isAnimating = false
+	-- Debounce persists across equips/unequips
+	print("Pickaxe unequipped - debounce state preserved")
+end
+
+-- Connect events
+tool.Activated:Connect(onActivated)
+tool.Equipped:Connect(onEquipped)
+tool.Unequipped:Connect(onUnequipped)
+mineResponseEvent.OnClientEvent:Connect(onMineResponse)
+oreHealthResponseEvent.OnClientEvent:Connect(onOreHealthResponse)
+oreHealthUpdateEvent.OnClientEvent:Connect(onOreHealthUpdate) -- New: Real-time updates
+
+print("LocalScript loaded for", tool.Name, "with damage:", DAMAGE, "and cooldown:", COOLDOWN, "seconds")
