@@ -1,0 +1,434 @@
+-- ServerScript in ServerScriptService
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+-- Create RemoteEvents
+local remoteEvent = Instance.new("RemoteEvent")
+remoteEvent.Name = "MineOreEvent"
+remoteEvent.Parent = ReplicatedStorage
+
+local mineResponseEvent = Instance.new("RemoteEvent")
+mineResponseEvent.Name = "MineResponseEvent"
+mineResponseEvent.Parent = ReplicatedStorage
+
+local oreHealthRequestEvent = Instance.new("RemoteEvent")
+oreHealthRequestEvent.Name = "OreHealthRequestEvent"
+oreHealthRequestEvent.Parent = ReplicatedStorage
+
+local oreHealthResponseEvent = Instance.new("RemoteEvent")
+oreHealthResponseEvent.Name = "OreHealthResponseEvent"
+oreHealthResponseEvent.Parent = ReplicatedStorage
+
+-- New RemoteEvent for broadcasting health updates to all viewers
+local oreHealthUpdateEvent = Instance.new("RemoteEvent")
+oreHealthUpdateEvent.Name = "OreHealthUpdateEvent"
+oreHealthUpdateEvent.Parent = ReplicatedStorage
+
+-- ORE CONFIGURATION - CUSTOMIZE THIS LIST TO ADD/REMOVE MINEABLE ORES
+local mineableOres = {
+	-- Ore name = health value
+	["Stone"] = 50,
+	["Coal"] = 30,
+	["Iron"] = 75,
+	["Gold"] = 100,
+	["Diamond"] = 150,
+	["Emerald"] = 120,
+	["Ruby"] = 110,
+	["Sapphire"] = 110,
+	["Copper"] = 40,
+	["Silver"] = 90,
+	-- Add more ores here easily
+}
+
+-- ORE REWARDS CONFIGURATION - What items players get when mining ores
+local oreRewards = {
+	["Stone"] = {itemName = "Stone", quantity = 1},
+	["Coal"] = {itemName = "Coal", quantity = 1},
+	["Iron"] = {itemName = "Iron", quantity = 1},
+	["Gold"] = {itemName = "Gold", quantity = 1},
+	["Diamond"] = {itemName = "Diamond", quantity = 1},
+	["Emerald"] = {itemName = "Emerald", quantity = 1},
+	["Ruby"] = {itemName = "Ruby", quantity = 1},
+	["Sapphire"] = {itemName = "Sapphire", quantity = 1},
+	["Copper"] = {itemName = "Copper", quantity = 1},
+	["Silver"] = {itemName = "Silver", quantity = 1},
+}
+
+-- CLAIMING SYSTEM CONFIGURATION
+local CLAIM_DURATION = 15 -- Seconds an ore stays claimed after last hit
+
+-- Store ore health data - using the part itself as the key
+local oreHealthData = {}
+-- Store ore claim data - using the part itself as the key
+local oreClaimData = {} -- {player = Player, claimTime = tick()}
+-- Store which players are viewing which ores - using the part as key
+local oreViewers = {} -- {[part] = {player1, player2, ...}}
+
+-- Wait for backpack system to load
+local function waitForBackpackSystem()
+	local attempts = 0
+	while not _G.ServerBackpackFunctions and attempts < 50 do
+		wait(0.1)
+		attempts = attempts + 1
+	end
+
+	if _G.ServerBackpackFunctions then
+		print("✅ Backpack system found - mining integration enabled")
+		return true
+	else
+		warn("❌ Backpack system not found after 5 seconds - ore rewards disabled")
+		return false
+	end
+end
+
+local backpackSystemAvailable = false
+
+-- Initialize backpack system connection
+spawn(function()
+	backpackSystemAvailable = waitForBackpackSystem()
+end)
+
+local function isOre(part)
+	-- Check if the part name exists in our mineable ores list
+	return part and mineableOres[part.Name] ~= nil
+end
+
+-- Initialize ore health when first hit
+local function initializeOreHealth(part)
+	if not oreHealthData[part] and isOre(part) then
+		oreHealthData[part] = mineableOres[part.Name]
+		print("Initialized", part.Name, "with", oreHealthData[part], "health")
+	end
+end
+
+-- Get ore health info
+local function getOreHealth(part)
+	if not isOre(part) then
+		return nil, nil
+	end
+
+	initializeOreHealth(part)
+	local currentHealth = oreHealthData[part] or mineableOres[part.Name]
+	local maxHealth = mineableOres[part.Name]
+
+	return currentHealth, maxHealth
+end
+
+-- Check if ore is claimed by another player
+local function isOreClaimed(part, player)
+	local claimData = oreClaimData[part]
+	if not claimData then
+		return false, nil -- Not claimed
+	end
+
+	-- Check if claim has expired
+	local timeSinceClaim = tick() - claimData.claimTime
+	if timeSinceClaim > CLAIM_DURATION then
+		-- Claim expired, remove it
+		oreClaimData[part] = nil
+		return false, nil
+	end
+
+	-- Check if claimed by different player
+	if claimData.player ~= player then
+		return true, claimData.player -- Claimed by someone else
+	end
+
+	return false, claimData.player -- Claimed by same player (or not claimed)
+end
+
+-- Claim an ore for a player
+local function claimOre(part, player)
+	oreClaimData[part] = {
+		player = player,
+		claimTime = tick()
+	}
+	print(player.Name .. " claimed " .. part.Name)
+end
+
+-- Add a player to the viewers list for an ore
+local function addOreViewer(part, player)
+	if not oreViewers[part] then
+		oreViewers[part] = {}
+	end
+
+	-- Check if player is already in the list
+	for i, viewer in ipairs(oreViewers[part]) do
+		if viewer == player then
+			return -- Already viewing
+		end
+	end
+
+	-- Add player to viewers
+	table.insert(oreViewers[part], player)
+	print(player.Name .. " is now viewing " .. part.Name)
+end
+
+-- Remove a player from the viewers list for an ore
+local function removeOreViewer(part, player)
+	if not oreViewers[part] then return end
+
+	for i, viewer in ipairs(oreViewers[part]) do
+		if viewer == player then
+			table.remove(oreViewers[part], i)
+			print(player.Name .. " stopped viewing " .. part.Name)
+			break
+		end
+	end
+
+	-- Clean up empty viewer lists
+	if #oreViewers[part] == 0 then
+		oreViewers[part] = nil
+	end
+end
+
+-- Broadcast health update to all players viewing this ore
+local function broadcastHealthUpdate(part, currentHealth, maxHealth, claimOwner)
+	if not oreViewers[part] then return end
+
+	for _, viewer in ipairs(oreViewers[part]) do
+		if viewer.Parent then -- Make sure player is still in game
+			local isClaimedByOther = claimOwner and claimOwner ~= viewer
+			oreHealthUpdateEvent:FireClient(viewer, part, currentHealth, maxHealth, part.Name, isClaimedByOther)
+		end
+	end
+end
+
+-- Give ore reward to player
+local function giveOreReward(player, oreName)
+	if not backpackSystemAvailable then
+		print("⚠️ Backpack system not available - cannot give reward")
+		return false
+	end
+
+	local reward = oreRewards[oreName]
+	if not reward then
+		print("⚠️ No reward configured for ore:", oreName)
+		return false
+	end
+
+	if _G.ServerBackpackFunctions and _G.ServerBackpackFunctions.giveItemToPlayer then
+		local success = _G.ServerBackpackFunctions.giveItemToPlayer(player, reward.itemName, reward.quantity)
+		if success then
+			print("✅ Gave " .. player.Name .. " " .. reward.quantity .. " " .. reward.itemName .. " from mining " .. oreName)
+			return true
+		else
+			warn("❌ Failed to give reward to " .. player.Name)
+			return false
+		end
+	else
+		warn("❌ Backpack function not available")
+		return false
+	end
+end
+
+-- Clean up expired claims and disconnected viewers periodically
+spawn(function()
+	while true do
+		wait(5) -- Check every 5 seconds
+		local currentTime = tick()
+
+		-- Clean up expired claims
+		for part, claimData in pairs(oreClaimData) do
+			if not part.Parent then
+				-- Part was destroyed, remove claim and viewers
+				oreClaimData[part] = nil
+				oreViewers[part] = nil
+			elseif currentTime - claimData.claimTime > CLAIM_DURATION then
+				-- Claim expired, remove it and broadcast update
+				oreClaimData[part] = nil
+				print("Claim expired for", part.Name, "previously owned by", claimData.player.Name)
+
+				-- Broadcast that claim expired
+				local currentHealth, maxHealth = getOreHealth(part)
+				if currentHealth and maxHealth then
+					broadcastHealthUpdate(part, currentHealth, maxHealth, nil)
+				end
+			end
+		end
+
+		-- Clean up disconnected viewers
+		for part, viewers in pairs(oreViewers) do
+			if not part.Parent then
+				oreViewers[part] = nil
+			else
+				for i = #viewers, 1, -1 do
+					if not viewers[i].Parent then
+						table.remove(viewers, i)
+					end
+				end
+				if #viewers == 0 then
+					oreViewers[part] = nil
+				end
+			end
+		end
+	end
+end)
+
+local function damageOre(part, damage, player)
+	if not part or not part.Parent or not isOre(part) then
+		return false, nil, nil
+	end
+
+	-- Initialize health if first hit
+	initializeOreHealth(part)
+
+	-- Get current health
+	local currentHealth = oreHealthData[part]
+	local newHealth = math.max(0, currentHealth - damage)
+	local maxHealth = mineableOres[part.Name]
+
+	-- Update health
+	oreHealthData[part] = newHealth
+
+	-- Claim the ore for this player (resets claim timer)
+	claimOre(part, player)
+
+	print(player.Name .. " hit " .. part.Name .. " for " .. damage .. " damage! Health: " .. newHealth .. "/" .. maxHealth)
+
+	-- Broadcast health update to all viewers (except the player who hit it)
+	broadcastHealthUpdate(part, newHealth, maxHealth, player)
+
+	-- Check if ore is destroyed
+	if newHealth <= 0 then
+		print(part.Name .. " has been destroyed!")
+
+		-- Give ore reward to player before destroying
+		giveOreReward(player, part.Name)
+
+		-- Clean up health, claim, and viewer data
+		oreHealthData[part] = nil
+		oreClaimData[part] = nil
+		oreViewers[part] = nil
+
+		-- Destroy the ore
+		part:Destroy()
+		return true, newHealth, maxHealth -- Ore was destroyed
+	end
+
+	return false, newHealth, maxHealth -- Ore still alive, return new health
+end
+
+-- Handle ore health requests from client
+local function onOreHealthRequest(player, targetPart)
+	if not targetPart or not targetPart.Parent then
+		-- Send back that it's not an ore
+		oreHealthResponseEvent:FireClient(player, false)
+		-- Remove from viewers if they were viewing this part
+		removeOreViewer(targetPart, player)
+		return
+	end
+
+	if isOre(targetPart) then
+		local currentHealth, maxHealth = getOreHealth(targetPart)
+		local isClaimed, claimOwner = isOreClaimed(targetPart, player)
+
+		-- Add player to viewers list
+		addOreViewer(targetPart, player)
+
+		-- Send health data with claim status
+		oreHealthResponseEvent:FireClient(player, true, currentHealth, maxHealth, targetPart.Name, targetPart, isClaimed)
+	else
+		oreHealthResponseEvent:FireClient(player, false)
+		-- Remove from viewers since it's not an ore
+		removeOreViewer(targetPart, player)
+	end
+end
+
+local function onMineOreEvent(player, targetPart, damage)
+	print("Server received mining request from", player.Name, "with damage:", damage)
+
+	-- Validate damage (prevent cheating)
+	if not damage or damage <= 0 or damage > 1000 then
+		print("Invalid damage:", damage)
+		return
+	end
+
+	-- Validate player has character
+	local character = player.Character
+	if not character then 
+		print("No character found")
+		return 
+	end
+
+	-- Check if player has a pickaxe equipped - FIXED VERSION
+	local tool = character:FindFirstChildOfClass("Tool")
+	if not tool then
+		print("No tool equipped")
+		return
+	end
+
+	-- Better pickaxe validation - check if "pickaxe" is found in the tool name
+	local toolNameLower = string.lower(tool.Name)
+	local hasPickaxe = string.find(toolNameLower, "pickaxe") ~= nil
+
+	if not hasPickaxe then
+		print("No pickaxe equipped - tool name:", tool.Name)
+		return
+	end
+
+	print("Valid pickaxe found:", tool.Name)
+
+	-- Validate target exists
+	if not targetPart or not targetPart.Parent then
+		print("Invalid target part")
+		return
+	end
+
+	-- Check distance
+	local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+	if humanoidRootPart then
+		local distance = (humanoidRootPart.Position - targetPart.Position).Magnitude
+		if distance > 20 then
+			print("Too far away to mine")
+			-- Send no-hit response for being too far away
+			mineResponseEvent:FireClient(player, false, targetPart.Name, false)
+			return
+		end
+	end
+
+	-- Check if target is an ore and handle accordingly
+	local wasOre = isOre(targetPart)
+	local wasDestroyed = false
+	local newHealth, maxHealth = nil, nil
+
+	if wasOre then
+		-- Check if ore is claimed by another player
+		local isClaimed, claimOwner = isOreClaimed(targetPart, player)
+
+		if isClaimed then
+			print(player.Name .. " tried to mine " .. targetPart.Name .. " but it's claimed by " .. claimOwner.Name)
+			-- Send blocked response - ore is claimed by someone else
+			mineResponseEvent:FireClient(player, wasOre, targetPart.Name, false, targetPart, nil, nil, true)
+			return
+		end
+
+		-- Damage the ore and get updated health info
+		wasDestroyed, newHealth, maxHealth = damageOre(targetPart, damage, player)
+		print("Hit ore:", targetPart.Name, "- Destroyed:", wasDestroyed, "New Health:", newHealth)
+	else
+		print("Hit non-ore:", targetPart.Name)
+	end
+
+	-- Send response back to client for sound playing and health bar updates
+	-- Include new health data for immediate update
+	mineResponseEvent:FireClient(player, wasOre, targetPart.Name, wasDestroyed, targetPart, newHealth, maxHealth, false)
+end
+
+-- Handle player leaving to clean up viewers
+Players.PlayerRemoving:Connect(function(player)
+	-- Remove player from all ore viewer lists
+	for part, viewers in pairs(oreViewers) do
+		removeOreViewer(part, player)
+	end
+end)
+
+remoteEvent.OnServerEvent:Connect(onMineOreEvent)
+oreHealthRequestEvent.OnServerEvent:Connect(onOreHealthRequest)
+
+print("Mining system server script loaded - server handles ore detection, health bars, claiming system, and real-time updates")
+print("💎 Ore rewards system enabled:")
+for oreName, reward in pairs(oreRewards) do
+	print("  🔹 " .. oreName .. " → " .. reward.quantity .. " " .. reward.itemName)
+end
